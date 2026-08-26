@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+.venv/
+
+# VS Code
+.vscode/
+
+# OS file
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data Paths
+data/raw/
+data/processed/
+
+# User-defined files
+project_plan.txt
