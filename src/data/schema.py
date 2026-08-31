@@ -29,3 +29,5 @@ SAML_D_SCHEMA_OVERRIDES = {
     'Is_laundering': pl.Int8,
     'Laundering_type': pl.String
 }
+
+SAML_D_TIMESTAMP_FORMAT = '%Y-%m-%d %H:%M:%S'
