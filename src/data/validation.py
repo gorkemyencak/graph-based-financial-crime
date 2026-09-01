@@ -4,7 +4,9 @@ from pathlib import Path
 from src.data.schema import (
     SAML_D_REQUIRED_COLUMNS,
     SAML_D_SCHEMA_OVERRIDES,
-    SAML_D_TIMESTAMP_FORMAT
+    SAML_D_TIMESTAMP_FORMAT,
+    SAML_D_INTERIM_COLUMNS,
+    SAML_D_INTERIM_SCHEMA
 )
 
 class SAMLDDataValidator:
@@ -394,3 +396,79 @@ class SAMLDDataValidator:
             )
 
         return summary
+    
+    @staticmethod
+    def validate_interim_file(file_path: Path) -> None:
+        """ Validate that the interim Parquet dataset is usable """
+        # check whether file_path exists
+        if not file_path.exists():
+            raise FileNotFoundError(
+                f'SAML-D interim file does not exist: {file_path}'
+            )
+
+        # check whether file_path is a file
+        if not file_path.is_file():
+            raise ValueError(
+                f'SAML-D interim path is not a file: {file_path}'
+            )
+
+        # check whether suffix is valid
+        if file_path.suffix.lower() != '.parquet':
+            raise ValueError(
+                'SAML-D interim file must be Parquet, '
+                f'received: {file_path.suffix}'
+            )
+
+        # check whether file_path is empty
+        if file_path.stat().st_size == 0:
+            raise ValueError(
+                f'SAML-D interim file is empty: {file_path}'
+            )
+
+    @staticmethod
+    def validate_interim_schema(lazy_frame: pl.LazyFrame) -> None:
+        """ Validate the standardized SML-D Parquet schema, including column order and data types """
+        # get the actual schema from interim file
+        actual_schema = lazy_frame.collect_schema()
+
+        # actual columns in the interim file
+        actual_columns = actual_schema.names()
+
+        # expected columns in the interim dataset
+        expected_columns = list(
+            SAML_D_INTERIM_COLUMNS
+        )
+
+        # check the mismatch between actual and expected columns
+        if actual_columns != expected_columns:
+            raise ValueError(
+                'SAML-D interim colun validation failed. '
+                f'Expected: {expected_columns}. '
+                f'Received: {actual_columns}.'
+            )
+
+        # validate data types
+        invalid_dtypes: list[str] = []
+
+        for column_name, expected_dtype in SAML_D_INTERIM_SCHEMA.items():
+            # actual dtype of a column in the interim schema
+            actual_dtype = actual_schema[column_name]
+
+            # check whether actual vs. expected dtypes are matching
+            if actual_dtype != expected_dtype:
+                invalid_dtypes.append(
+                    f'{column_name}: '
+                    f'expected {expected_dtype}, '
+                    f'received {actual_dtype}'
+                )
+
+        # sorted invalid dtypes if present
+        if invalid_dtypes:
+            sorted_invalid_dtypes = '; '.join(
+                sorted(invalid_dtypes)
+            )
+
+            raise ValueError(
+                'SAML-D interim data type validation failed. '
+                f'{sorted_invalid_dtypes}'
+            )

@@ -17,6 +17,7 @@ __pycache__/
 # Data Paths
 data/raw/
 data/processed/
+data/interim/
 
 # User-defined files
 project_plan.txt
