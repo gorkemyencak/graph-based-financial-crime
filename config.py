@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from datetime import datetime
+
 def get_project_root(
         start_path: Path
 ) -> Path:
@@ -35,3 +37,22 @@ SAML_D_FILE_NAME = "SAML-D.csv"
 
 SAML_D_RAW_PATH = RAW_DATA_DIR / SAML_D_FILE_NAME
 SAML_D_INTERIM_PATH = INTERIM_DATA_DIR / 'saml_d_transactions.parquet'
+
+# historical, validation, and test windows
+SAML_D_VALIDATION_START = datetime(
+    year = 2023,
+    month = 6, 
+    day = 1
+)
+
+SAML_D_TEST_START = datetime(
+    year = 2023,
+    month = 7, 
+    day = 1
+)
+
+SAML_D_TEST_END_EXCLUSIVE = datetime(
+    year = 2023,
+    month = 8,
+    day = 23
+)

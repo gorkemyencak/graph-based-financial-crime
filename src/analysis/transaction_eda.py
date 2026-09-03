@@ -901,6 +901,15 @@ class SAMLDTransactionEDA:
                     )
                 ]
             )
+            .with_columns(
+                # repeated directed pair rate
+                (
+                    pl.col('repeated_directed_pair_count') / pl.col('directed_pair_count')
+                )
+                .alias(
+                    'repeated_directed_pair_rate'
+                )
+            )
         )
 
         return self._collect(
