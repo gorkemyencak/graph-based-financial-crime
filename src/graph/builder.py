@@ -479,3 +479,219 @@ class SAMLDGraphTableBuilder:
                 ]
             )
         )
+
+    def build_edge_table(
+            self,
+            cutoff: datetime
+    ) -> pl.LazyFrame:
+        """  
+        Build one aggregated edge per directed account pair
+        
+        Raw amount is not aggregated since the transactions contain multiple currencies
+        """
+        # filter historical transactions
+        historical_transactions = self._filter_history(
+            cutoff = cutoff
+        )
+
+        # account-to-node ID mapping
+        account_index = self._build_account_index(
+            transactions = historical_transactions
+        )
+
+        # source index
+        source_index = (
+            account_index
+            .select(
+                [
+                    # sender account
+                    pl.col('account')
+                    .alias(
+                        'sender_account'
+                    ),
+                    # source node id
+                    pl.col('node_id')
+                    .alias(
+                        'source_node_id'
+                    )
+                ]
+            )
+        )
+
+        # target index
+        target_index = (
+            account_index
+            .select(
+                [
+                    # receiver account
+                    pl.col('account')
+                    .alias(
+                        'receiver_account'
+                    ),
+                    # target node id
+                    pl.col('node_id')
+                    .alias(
+                        'target_node_id'
+                    )
+                ]
+            )
+        )
+
+        # aggregated edges er directed account pair
+        aggregated_edges = (
+            historical_transactions
+            .group_by(
+                [
+                    'sender_account',
+                    'receiver_account'
+                ]
+            )
+            .agg(
+                [
+                    # transaction count
+                    pl.len()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'transaction_count'
+                    ),
+                    # first transaction timestamp
+                    pl.col('timestamp')
+                    .min()
+                    .alias(
+                        'first_transaction_timestamp'
+                    ),
+                    # last transaction timestamp
+                    pl.col('timestamp')
+                    .max()
+                    .alias(
+                        'last_transaction_timestamp'
+                    ),
+                    # active day count
+                    pl.col('timestamp')
+                    .dt.date()
+                    .n_unique()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'active_day_count'
+                    ),
+                    # payment type count
+                    pl.col('payment_type')
+                    .n_unique()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'payment_type_count'
+                    ),
+                    # payment currency count
+                    pl.col('payment_currency')
+                    .n_unique()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'payment_currency_count'
+                    ),
+                    # received currency count
+                    pl.col('received_currency')
+                    .n_unique()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'received_currency_count'
+                    ),
+                    # cross currency transaction count
+                    (
+                        pl.col('payment_currency') != pl.col('received_currency')
+                    )
+                    .sum()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'cross_currency_transaction_count'
+                    )
+                ]
+            )
+            .with_columns(
+                [
+                    # count weight
+                    pl.col('transaction_count')
+                    .cast(pl.Float64)
+                    .alias(
+                        'count_weight'
+                    ),
+                    # log count weight
+                    pl.col('transaction_count')
+                    .cast(pl.Float64)
+                    .log1p()
+                    .alias(
+                        'log_count_weight'
+                    ),
+                    # cross currency share
+                    (
+                        pl.col('cross_currency_transaction_count') / pl.col('transaction_count')
+                    )
+                    .alias(
+                        'cross_currency_share'
+                    ),
+                    # repeated edge label
+                    (
+                        pl.col('transaction_count') > 0
+                    )
+                    .alias(
+                        'is_repeated_edge'
+                    ),
+                    # self loop label
+                    (
+                        pl.col('sender_account') == pl.col('receiver_account')
+                    )
+                    .alias(
+                        'is_self_loop'
+                    )
+                ]
+            )
+        )
+
+        return (
+            aggregated_edges
+            .join(
+                source_index,
+                on = 'sender_account',
+                how = 'left'
+            )
+            .join(
+                target_index,
+                on = 'receiver_account',
+                how = 'left'
+            )
+            .sort(
+                by = [
+                    'source_node_id',
+                    'target_node_id'
+                ]
+            )
+            .with_row_index(
+                name = 'edge_id',
+                offset = 0
+            )
+            .with_columns(
+                pl.col('edge_id')
+                .cast(pl.UInt64)
+            )
+            .select(
+                [
+                    'edge_id',
+                    'source_node_id',
+                    'target_node_id',
+                    'sender_account',
+                    'receiver_account',
+                    'transaction_account',
+                    'count_weight',
+                    'log_count_weight',
+                    'first_transaction_timestamp',
+                    'last_transaction_timestamp',
+                    'active_day_count',
+                    'payment_type_count',
+                    'payment_currency_count',
+                    'received_currency_count',
+                    'cross_currency_transaction_count',
+                    'cross_currency_share',
+                    'is_repeated_edge',
+                    'is_self_loop'
+                ]
+            )
+        )
