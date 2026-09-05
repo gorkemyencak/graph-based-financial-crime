@@ -105,7 +105,7 @@ class SAMLDGraphTableBuilder:
         sender_accounts = (
             transactions
             .select(
-                pl.col('sender_accounts')
+                pl.col('sender_account')
                 .alias(
                     'account'
                 )
@@ -116,7 +116,7 @@ class SAMLDGraphTableBuilder:
         receiver_accounts = (
             transactions
             .select(
-                pl.col('receiver_accounts')
+                pl.col('receiver_account')
                 .alias(
                     'account'
                 )
@@ -478,6 +478,9 @@ class SAMLDGraphTableBuilder:
                     'has_incoming_activity'
                 ]
             )
+            .sort(
+                by = ['node_id']
+            )
         )
 
     def build_edge_table(
@@ -630,7 +633,7 @@ class SAMLDGraphTableBuilder:
                     ),
                     # repeated edge label
                     (
-                        pl.col('transaction_count') > 0
+                        pl.col('transaction_count') > 1
                     )
                     .alias(
                         'is_repeated_edge'
@@ -679,7 +682,7 @@ class SAMLDGraphTableBuilder:
                     'target_node_id',
                     'sender_account',
                     'receiver_account',
-                    'transaction_account',
+                    'transaction_count',
                     'count_weight',
                     'log_count_weight',
                     'first_transaction_timestamp',
@@ -693,5 +696,274 @@ class SAMLDGraphTableBuilder:
                     'is_repeated_edge',
                     'is_self_loop'
                 ]
+            )
+        )
+
+    def get_snapshot_summary(
+            self,
+            cutoff: datetime
+    ) -> pl.DataFrame:
+        """ Return integrity and size statistics for a graph snapshot """
+        # filter historical transactions
+        historical_transactions = self._filter_history(
+            cutoff = cutoff
+        )
+
+        # node table
+        nodes = self.build_node_table(
+            cutoff = cutoff
+        )
+
+        # edge table
+        edges = self.build_edge_table(
+            cutoff = cutoff
+        )
+
+        # transaction summary
+        transaction_summary = (
+            historical_transactions
+            .select(
+                [
+                    # historical transaction count
+                    pl.len()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'historical_transaction_count'
+                    ),
+                    # self loop transaction count
+                    (
+                        pl.col('sender_account') == pl.col('receiver_account')
+                    )
+                    .sum()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'self_loop_transaction_count'
+                    )
+                ]
+            )
+        )
+
+        # node summary
+        node_summary = (
+            nodes
+            .select(
+                [
+                    # node count
+                    pl.len()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'node_count'
+                    ),
+                    # unique account count
+                    pl.col('account')
+                    .n_unique()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'unique_account_count'
+                    ),
+                    # unique node id count
+                    pl.col('node_id')
+                    .n_unique()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'unique_node_id_count'
+                    ),
+                    # minimum node id
+                    pl.col('node_id')
+                    .min()
+                    .alias(
+                        'minimum_node_id'
+                    ),
+                    # maximum node id
+                    pl.col('node_id')
+                    .max()
+                    .alias(
+                        'maximum_node_id'
+                    ),
+                    # sender & receiver node count
+                    (
+                        pl.col('has_outgoing_activity')
+                        & pl.col('has_incoming_activity')
+                    )
+                    .sum()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'sender_and_receiver_node_count'
+                    ),
+                    # sender only node count
+                    (
+                        pl.col('has_outgoing_activity')
+                        & ~pl.col('has_incoming_activity')
+                    )
+                    .sum()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'sender_only_node_count'
+                    ),
+                    # receiver only node count
+                    (
+                        pl.col('has_incoming_activity')
+                        & ~pl.col('has_outgoing_activity')
+                    )
+                    .sum()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'receiver_only_node_count'
+                    ),
+                    # multi location node count
+                    pl.col('is_multi_location')
+                    .sum()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'multi_location_node_count'
+                    )
+                ]
+            )
+        )
+
+        # edge summary
+        edge_summary = (
+            edges
+            .select(
+                [
+                    # edge count
+                    pl.len()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'edge_count'
+                    ),
+                    # unique directed pair count
+                    pl.struct(
+                        [
+                            'sender_account',
+                            'receiver_account'
+                        ]
+                    )
+                    .n_unique()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'unique_directed_pair_count'
+                    ),
+                    # edge transaction count
+                    pl.col('transaction_count')
+                    .sum()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'edge_transaction_count'
+                    ),
+                    # repeated edge count
+                    (
+                        pl.col('transaction_count') > 1
+                    )
+                    .sum()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'repeated_edge_count'
+                    ),
+                    # maximum transactions per edge
+                    pl.col('transaction_count')
+                    .max()
+                    .alias(
+                        'maximum_transactions_per_edge'
+                    ),
+                    # mean transactions per edge
+                    pl.col('transaction_count')
+                    .mean()
+                    .alias(
+                        'mean_transactions_per_edge'
+                    ),
+                    # self loop edge count
+                    pl.col('is_self_loop')
+                    .sum()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'self_loop_edge_count'
+                    ),
+                    # missing source node id count
+                    pl.col('source_node_id')
+                    .null_count()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'missing_source_node_id_count'
+                    ),
+                    # missing target node id count
+                    pl.col('target_node_id')
+                    .null_count()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'missing_target_node_id_count'
+                    )
+                ]
+            )
+        )
+
+        return (
+            transaction_summary
+            .join(
+                node_summary,
+                how = 'cross'
+            )
+            .join(
+                edge_summary,
+                how = 'cross'
+            )
+            .with_columns(
+                [
+                   # snapshot cutoff
+                   pl.lit(cutoff)
+                   .alias(
+                       'snapshot_cutoff'
+                   ),
+                   # repeated edge share
+                   pl.when(
+                       pl.col('edge_count') > 0
+                   )
+                   .then(
+                       pl.col('repeated_edge_count') / pl.col('edge_count')
+                   )
+                   .otherwise(
+                       None
+                   )
+                   .alias(
+                       'repeated_edge_share'
+                   ),
+                   # transaction reconciliation difference
+                   (
+                       pl.col('historical_transaction_count').cast(pl.Int64) - pl.col('edge_transaction_count').cast(pl.Int64)
+                   )
+                   .alias(
+                       'transaction_reconciliation_difference'
+                   )
+                ]
+            )
+            .select(
+                [
+                    'snapshot_cutoff',
+                    'historical_transaction_count',
+                    'edge_transaction_count',
+                    'transaction_reconciliation_difference',
+                    'node_count',
+                    'unique_account_count',
+                    'unique_node_id_count',
+                    'minimum_node_id',
+                    'maximum_node_id',
+                    'edge_count',
+                    'unique_directed_pair_count',
+                    'repeated_edge_count',
+                    'repeated_edge_share',
+                    'maximum_transactions_per_edge',
+                    'mean_transactions_per_edge',
+                    'self_loop_transaction_count',
+                    'self_loop_edge_count',
+                    'missing_source_node_id_count',
+                    'missing_target_node_id_count',
+                    'sender_and_receiver_node_count',
+                    'sender_only_node_count',
+                    'receiver_only_node_count',
+                    'multi_location_node_count'
+                ]
+            )
+            .collect(
+                engine = 'streaming'
             )
         )
