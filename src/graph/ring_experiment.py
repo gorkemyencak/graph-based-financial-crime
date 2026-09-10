@@ -1149,11 +1149,619 @@ class SAMLDRingExperimentBuilder:
         )
 
     ### public construction methods
+    def build_observation_graph_tables(self) -> dict[str, pl.LazyFrame]:
+        """ Build label-free graph tables through the validation window """
+        return {
+            'nodes': self.graph_builder.build_node_table(
+                cutoff = self.validation_end_exclusive
+            ),
+            'edges': self.graph_builder.build_edge_table(
+                cutoff = self.validation_end_exclusive
+            )
+        }
 
-        
+    def build_component_summary(
+            self,
+            force_rebuild: bool = False
+    ) -> pl.DataFrame:
+        """ Return all suspicious component sizes and eligibility flags """
+        # validate if self._component_summary_cache is empty or force_rebuild is True
+        if self._component_summary_cache is None or force_rebuild:
+            # suspicious transactions
+            suspicious_transactions = self._collect_validation_suspicious_transactions()
+
+            # component membership
+            _, component_summary = self._build_component_membership(
+                suspicious_transactions = suspicious_transactions
+            )
+
+            self._component_summary_cache = component_summary
+
+        return self._component_summary_cache
+
+    def build_ring_tables(
+            self,
+            force_rebuild: bool = False
+    ) -> dict[str, pl.DataFrame]:
+        """ Build ring, account, seed, and withheld-target variables """
+        # validate if self._ring_table_cache is empty or force_rebuild is True
+        if self._ring_tables_cache is None or force_rebuild:
+            # suspicious transactions
+            suspicious_transactions = self._collect_validation_suspicious_transactions()
+
+            # component membership
+            component_membership, component_summary = self._build_component_membership(
+                suspicious_transactions = suspicious_transactions
+            )
+
+            self._component_summary_cache = component_summary
+
+            # account activity
+            account_activity = self._build_account_activity(
+                suspicious_transactions = suspicious_transactions
+            )
+
+            # ring accounts
+            ring_accounts = (
+                component_membership
+                .join(
+                    account_activity,
+                    on = 'account',
+                    how = 'left'
+                )
+            )
+
+            # ring sizes
+            ring_sizes = (
+                ring_accounts
+                .group_by(
+                    'ring_id'
+                )
+                .agg(
+                    # ring size
+                    pl.len()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'ring_size'
+                    )
+                )
+                .with_columns(
+                    # requested seed count
+                    pl.max_horizontal(
+                        [
+                            # minimum seed count
+                            pl.lit(
+                                self.minimum_seed_count,
+                                dtype = pl.UInt64
+                            ),
+                            # ring_size * self.seed_fraction
+                            (
+                                pl.col('ring_size')
+                                .cast(pl.Float64)
+                                * self.seed_fraction
+                            )
+                            .ceil()
+                            .cast(pl.UInt64)
+                        ]
+                    )
+                    .alias(
+                        'requested_seed_count'
+                    )
+                )
+                .with_columns(
+                    # seed count
+                    pl.min_horizontal(
+                        pl.col('requested_seed_count'),
+                        pl.col('ring_size') - 1
+                    )
+                    .cast(pl.UInt64)
+                    .alias(
+                        'seed_count'
+                    )
+                )
+                .with_columns(
+                    # target count
+                    (
+                        pl.col('ring_size') - pl.col('seed_cunt')
+                    )
+                    .cast(pl.UInt64)
+                    .alias(
+                        'target_count'
+                    )
+                )
+                .drop(
+                    'requested_seed_count'
+                )
+            )
+
+            # ring accounts with ring sizes
+            ring_accounts = (
+                ring_accounts
+                .join(
+                    ring_sizes,
+                    on = 'ring_id',
+                    how = 'left'
+                )
+                .sort(
+                    [
+                        'ring_id',
+                        'first_suspicious_timestamp',
+                        'account'
+                    ]
+                )
+                .with_columns(
+                    # ring member order
+                    pl.col('account')
+                    .cum_count()
+                    .over('ring_id')
+                    .cast(pl.UInt64)
+                    .alias(
+                        'ring_member_order'
+                    )
+                )
+                .with_columns(
+                    [
+                        # ring seed label
+                        (
+                            pl.col('ring_member_order') <= pl.col('seed_count')
+                        )
+                        .alias(
+                            'is_ring_seed'
+                        ),
+                        # ring target label
+                        (
+                            pl.col('ring_member_order') > pl.col('seed_count')
+                        )
+                        .alias(
+                            'is_ring_target'
+                        )
+                    ]
+                )
+            )
+
+            # node index
+            node_index = self._build_observation_node_index()
+
+            # ring accounts with node index
+            ring_accounts = (
+                ring_accounts
+                .lazy()
+                .join(
+                    node_index,
+                    on = 'account',
+                    how = 'left'
+                )
+                .collect(
+                    engine = 'streaming'
+                )
+            )
+
+            # missing node count, and validate those missing nodes
+            missing_node_count = (
+                ring_accounts
+                .get_column('node_id')
+                .null_count()
+            )
+
+            if missing_node_count > 0:
+                raise ValueError(
+                    f'{missing_node_count:,} ring accounts do not map to the validation observation graph'
+                )
+
+            ring_accounts = (
+                ring_accounts
+                .select(
+                    [
+                        'ring_id',
+                        'node_id',
+                        'account',
+                        'ring_member_order',
+                        'ring_size',
+                        'seed_count',
+                        'target_count',
+                        'first_suspicious_timestamp',
+                        'last_suspicious_timestamp',
+                        'suspicious_sender_event_count',
+                        'suspicious_receiver_event_count',
+                        'suspicious_account_event_count',
+                        'is_ring_seed',
+                        'is_ring_target'
+                    ]
+                )
+                .sort(
+                    [
+                        'ring_id',
+                        'ring_member_order'
+                    ]
+                )
+            )
+
+            # ring summary
+            rings = self._build_ring_summary(
+                suspicious_transactions = suspicious_transactions,
+                ring_accounts = ring_accounts
+            )
+
+            # seeds
+            seeds = (
+                ring_accounts
+                .filter(
+                    pl.col('is_ring_seed')
+                )
+                .with_columns(
+                    # seed order
+                    pl.col('ring_member_order')
+                    .alias(
+                        'seed_order'
+                    )
+                )
+                .select(
+                    [
+                        'ring_id',
+                        'node_id',
+                        'account',
+                        'seed_order',
+                        'ring_size',
+                        'seed_count',
+                        'target_count',
+                        'first_suspicious_timestamp',
+                        'last_suspicious_timestamp',
+                        'suspicious_sender_event_count',
+                        'suspicious_receiver_event_count',
+                        'suspicious_account_event_count'
+                    ]
+                )
+                .sort(
+                    [
+                        'ring_id',
+                        'seed_order'
+                    ]
+                )
+            )
+
+            # targets
+            targets = (
+                ring_accounts
+                .filter(
+                    pl.col('is_ring_target')
+                )
+                .with_columns(
+                    # target order
+                    (
+                        pl.col('ring_member_order') - pl.col('seed_count')
+                    )
+                    .cast(pl.UInt64)
+                    .alias(
+                        'target_order'
+                    )
+                )
+                .select(
+                    [
+                        'ring_id',
+                        'node_id',
+                        'account',
+                        'target_order',
+                        'ring_size',
+                        'seed_count',
+                        'target_count',
+                        'first_suspicious_timestamp',
+                        'last_suspicious_timestamp',
+                        'suspicious_sender_event_count',
+                        'suspicious_receiver_event_count',
+                        'suspicious_account_event_count'
+                    ]
+                )
+                .sort(
+                    [
+                        'ring_id',
+                        'target_order'
+                    ]
+                )
+            )
+
+            # populate self._ring_tables_cache
+            self._ring_tables_cache = {
+                'rings': rings,
+                'ring_accounts': ring_accounts,
+                'seeds': seeds,
+                'targets': targets
+            }
+
+        return {
+            table_name: table.clone()
+            for table_name, table in self._ring_tables_cache.items()
+        }
+
+    def build_experiment_summary(self) -> pl.DataFrame:
+        """ Return one-wor preparation statistics for the experiment """
+        # suspicious transactions
+        suspicious_transactions = self._collect_validation_suspicious_transactions()
+
+        # component summary
+        component_summary = self.build_component_summary(
+            force_rebuild = False
+        )
+
+        # ring tables
+        ring_tables = self.build_ring_tables(
+            force_rebuild = False
+        )
+
+        # rings
+        rings = ring_tables['rings']
+
+        return pl.DataFrame(
+            {
+                'validation_start': [self.validation_start],
+                'validation_end_exclusive': [self.validation_end_exclusive],
+                'validation_suspicious_transaction_count': [suspicious_transactions.height],
+                'suspicious_component_count': [component_summary.height],
+                'eligible_ring_count': [rings.height],
+                'excluded_component_count': [
+                    component_summary
+                    .filter(
+                        ~pl.col('is_eligible_ring')
+                    )
+                    .height
+                ],
+                'seed_account_count': [ring_tables['seeds'].height],
+                'target_account_count': [ring_tables['targets'].height],
+                'minimum_ring_size_observed': [
+                    rings
+                    .get_column(
+                        'ring_size'
+                    )
+                    .min()
+                ],
+                'median_ring_size': [
+                    rings
+                    .get_column(
+                        'ring_size'
+                    )
+                    .median()
+                ],
+                'maximum_ring_size_observed': [
+                    rings
+                    .get_column(
+                        'ring_size'
+                    )
+                    .max()
+                ],
+                'mixed_topology_ring_count': [
+                    rings
+                    .get_column(
+                        'is_mixed_typology_ring'
+                    )
+                    .sum()
+                ]
+            }
+        )
+
+    def build_reachability_summary(
+            self, 
+            use_persisted_graph: bool = True
+    ) -> pl.DataFrame:
+        """
+        Measure whether withheld targets are graph-reachable from pooled seeds
+
+        The diagnostic uses the label-free observation graph. Forward and reverse reachability indicate which PageRank
+        direction can propagate seed mass. Weak reachability is the basic feasibility check
+        """
+        # validate
+        if not isinstance(use_persisted_graph, bool):
+            raise TypeError(
+                'use_persisted_graph must be a boolean'
+            )
+
+        paths = self.get_experiment_paths()
+
+        # graph tables
+        if (
+            use_persisted_graph
+            & paths.nodes.is_file()
+            & paths.edges.is_file()
+        ):
+            graph_tables = {
+                'nodes': pl.scan_parquet(
+                    source = paths.nodes
+                ),
+                'edges': pl.scan_parquet(
+                    source = paths.edges
+                )
+            }
+        else:
+            graph_tables = self.build_observation_graph_tables()
+
+        # ring tables
+        ring_tables = self.build_ring_tables(
+            force_rebuild = False
+        )
+
+        # graph counts
+        graph_counts = (
+            pl.collect_all(
+                [
+                    # nodes
+                    graph_tables['nodes']
+                    .select(
+                        [
+                            # node count
+                            pl.len()
+                            .alias(
+                                'node_count'
+                            ),
+                            # maximum node id
+                            pl.col('node_id')
+                            .max()
+                            .alias(
+                                'maximum_node_id'
+                            )
+                        ]
+                    ),
+                    # edges
+                    graph_tables['edges']
+                    .select(
+                        # edge count
+                        pl.len()
+                        .alias(
+                            'edge_count'
+                        )
+                    )
+                ],
+                engine = 'streaming'
+            )
+        )
+
+        # node count
+        node_count = int(
+            graph_counts[0]
+            .get_column(
+                'node_count'
+            )
+            .item()
+        )
+
+        # maximum node id
+        maximum_node_id = int(
+            graph_counts[0]
+            .get_column(
+                'maximum_node_id'
+            )
+            .item()
+        )
+
+        # edge pairs
+        edge_pairs = (
+            graph_tables['edges']
+            .select(
+                [
+                    'source_node_id',
+                    'target_node_id'
+                ]
+            )
+            .collect(
+                engine = 'streaming'
+            )
+        )
+
+        # igraph
+        graph = ig.Graph(
+            n = node_count,
+            edges = [
+                (int(source_node_id), int(target_node_id))
+                for source_node_id, target_node_id in edge_pairs.iter_rows()
+            ],
+            directed = True
+        )
+
+        # seed node ids
+        seed_node_ids = [
+            int(node_id)
+            for node_id in (
+                ring_tables['seeds']
+                .get_column(
+                    'node_id'
+                )
+                .to_list()
+            )
+        ]
+
+        # target node ids
+        target_node_ids = [
+            int(node_id)
+            for node_id in (
+                ring_tables['targets']
+                .get_column(
+                    'node_id'
+                )
+                .to_list()
+            )
+        ]
+
+        # forward reachable nodes
+        forward_reachable = self._multi_source_reachable_nodes(
+            graph = graph,
+            seed_node_ids = seed_node_ids,
+            direction = 'forward'
+        )
+
+        # reverse reachable nodes
+        reverse_reachable = self._multi_source_reachable_nodes(
+            graph = graph,
+            seed_node_ids = seed_node_ids,
+            direction = 'reverse'
+        )
+
+        # weakly reachable nodes
+        weakly_reachable = self._multi_source_reachable_nodes(
+            graph = graph,
+            seed_node_ids = seed_node_ids,
+            direction = 'weak'
+        )
+
+        # forward targets
+        forward_targets = set(target_node_ids) & forward_reachable
+
+        # reverse targets
+        reverse_targets = set(target_node_ids) & reverse_reachable
+
+        # weak targets
+        weak_targets = set(target_node_ids) & weakly_reachable
+
+        # undirected targets
+        either_direction_targets = (
+            set(target_node_ids) & (forward_reachable | reverse_reachable)
+        )
+
+        # target count
+        target_count = len(target_node_ids)
+
+        return pl.DataFrame(
+            {
+                'observation_node_count': [node_count],
+                'observation_edge_count': [
+                    int(
+                        graph_counts[1]
+                        .get_column(
+                            'edge_count'
+                        )
+                        .item()
+                    )
+                ],
+                'weakly_reachable_target_count': [len(weak_targets)],
+                'weakly_reachable_target_share': [
+                    len(weak_targets) / target_count
+                ],
+                'forward_reachable_target_count': [len(forward_targets)],
+                'forward_reachable_target_share': [
+                    len(forward_targets) / target_count
+                ],
+                'reverse_reachable_target_count': [len(reverse_targets)],
+                'reverse_reachable_target_share': [
+                    len(reverse_targets) / target_count
+                ],
+                'either_direction_reachable_target_count': [len(either_direction_targets)],
+                'either_direction_reachable_target_share': [
+                    len(either_direction_targets) / target_count
+                ]
+            }
+        )
 
 
+    ### public persistence methods
+    def get_experiment_paths(self) -> RingExperimentPaths:
+        """ Return the standard artifact patahs for this experiment """
+        # validate output_dir is a Path instance
+        if not isinstance(self.output_dir, Path):
+            self.output_dir = Path(self.output_dir)
 
-
-
-         
+        return RingExperimentPaths(
+            directory = self.output_dir,
+            nodes = self.output_dir / 'nodes.parquet',
+            edges = self.output_dir / 'edges.parquet',
+            rings = self.output_dir / 'rings.parquet',
+            ring_accounts = self.output_dir / 'ring_accounts.parquet',
+            seeds = self.output_dir / 'seeds.parquet',
+            targets = self.output_dir / 'targets.parquet',
+            manifest = self.output_dir / 'manifest.json'
+        )
