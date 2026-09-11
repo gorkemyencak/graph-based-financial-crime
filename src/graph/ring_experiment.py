@@ -409,7 +409,7 @@ class SAMLDRingExperimentBuilder:
                 self.transactions
                 .filter(
                     (pl.col('timestamp') >= pl.lit(self.validation_start))
-                    & (pl.col('timestamp')) < pl.lit(self.validation_end_exclusive)
+                    & (pl.col('timestamp') < pl.lit(self.validation_end_exclusive))
                     & (pl.col('is_laundering') == 1)
                 )
                 .select(
@@ -545,7 +545,7 @@ class SAMLDRingExperimentBuilder:
             suspicious_transactions
             .select(
                 [
-                    'sender_account'
+                    'sender_account',
                     'receiver_account'
                 ]
             )
@@ -872,7 +872,7 @@ class SAMLDRingExperimentBuilder:
                         'first_suspicious_timestamp'
                     ),
                     # last suspicious timestamp
-                    pl.min_horizontal(
+                    pl.max_horizontal(
                         'sender_last_suspicious_timestamp',
                         'receiver_last_suspicious_timestamp'
                     )
@@ -1262,7 +1262,7 @@ class SAMLDRingExperimentBuilder:
                 .with_columns(
                     # target count
                     (
-                        pl.col('ring_size') - pl.col('seed_cunt')
+                        pl.col('ring_size') - pl.col('seed_count')
                     )
                     .cast(pl.UInt64)
                     .alias(
@@ -1473,7 +1473,7 @@ class SAMLDRingExperimentBuilder:
         }
 
     def build_experiment_summary(self) -> pl.DataFrame:
-        """ Return one-wor preparation statistics for the experiment """
+        """ Return one-word preparation statistics for the experiment """
         # suspicious transactions
         suspicious_transactions = self._collect_validation_suspicious_transactions()
 
@@ -1527,7 +1527,7 @@ class SAMLDRingExperimentBuilder:
                     )
                     .max()
                 ],
-                'mixed_topology_ring_count': [
+                'mixed_typology_ring_count': [
                     rings
                     .get_column(
                         'is_mixed_typology_ring'
@@ -1765,3 +1765,186 @@ class SAMLDRingExperimentBuilder:
             targets = self.output_dir / 'targets.parquet',
             manifest = self.output_dir / 'manifest.json'
         )
+
+    def validate_experiment(self) -> None:
+        """ Validate the files of an existing ring experiment """
+        # experiment paths
+        paths = self.get_experiment_paths()
+
+        # validate parquet files
+        for table_name, path in paths.parquet_paths().items():
+            self._validate_parquet_file(
+                table_name = table_name,
+                path = path
+            )
+
+        # validate if ring-experiment manifest exists
+        if not paths.manifest.is_file():
+            raise FileNotFoundError(
+                f'Ring-experiment manifest does not exist: {paths.manifest}'
+            )
+
+        # validate if ring-experiment manifest is empty on disk
+        if paths.manifest.stat().st_size == 0:
+            raise ValueError(
+                f'Ring-experiment manifest is empty: {paths.manifest}'
+            )
+
+    def scan_experiment(self) -> dict[str, pl.LazyFrame]:
+        """ Lazily scan the persisted Parquet experiment tables """
+        # validate files of an existing ring experiment
+        self.validate_experiment()
+
+        # experiment paths
+        paths = self.get_experiment_paths()
+
+        return {
+            table_name: pl.scan_parquet(source = path)
+            for table_name, path in paths.parquet_paths().items()
+        }
+
+    def write_experiment(
+            self,
+            overwrite: bool = False
+    ) -> RingExperimentPaths:
+        """ Build and persist the validation ring-expansion experiment """
+        # validate if overwrite is a boolean instance
+        if not isinstance(overwrite, bool):
+            raise TypeError(
+                'overwrite must be a boolean'
+            )
+
+        # experiment paths
+        paths = self.get_experiment_paths()
+
+        # experiment paths as dict
+        final_paths = paths.as_dict()
+
+        # artifacts
+        existing_artifacts = [
+            artifact_name
+            for artifact_name, path in final_paths.items()
+            if path.exists()
+        ]
+
+        if existing_artifacts and not overwrite:
+            if len(existing_artifacts) == len(final_paths):
+                # validate ring experiment
+                self.validate_experiment()
+
+                return paths
+
+            # sorted existing artifacts
+            sorted_existing_artifacts = ', '.join(
+                sorted(existing_artifacts)
+            )
+
+            raise FileExistsError(
+                'The ring experiment is incomplete. Existing artifacts: '
+                f'{sorted_existing_artifacts}. Re-run with overwrite=True to rebuild it'
+            )
+
+        # create paths directory
+        paths.directory.mkdir(
+            parents = True,
+            exist_ok = True
+        )
+
+        temporary_paths = {
+            artifact_name: self._get_temporary_path(path = path)
+            for artifact_name, path in final_paths.items()
+        }
+
+        for temporary_path in temporary_paths.values():
+            # unlink temporary path
+            temporary_path.unlink(
+                missing_ok = True
+            )
+
+        try:
+            graph_tables = self.build_observation_graph_tables()
+            ring_tables = self.build_ring_tables(
+                force_rebuild = False
+            )
+
+            # experiment tables
+            experiment_tables: dict[str, pl.LazyFrame] = {
+                **graph_tables,
+                **{
+                    table_name: table.lazy()
+                    for table_name, table in ring_tables.items()
+                }
+            }
+
+            # sink and validate parquet files in experiment tables
+            for table_name, lazy_frame in experiment_tables.items():
+                self._sink_parquet(
+                    lazy_frame = lazy_frame,
+                    path = temporary_paths[table_name]
+                )
+
+                self._validate_parquet_file(
+                    table_name = table_name,
+                    path = temporary_paths[table_name]
+                )
+
+            # experiment summary
+            summary = (
+                self.build_experiment_summary()
+                .to_dicts()[0]
+            )
+
+            # define manifest
+            manifest = {
+                'experiment': 'validation_ring_expansion',
+                'ring_definition': (
+                    'weak component of validation-window suspicious transaction graph'
+                ),
+                'seed_selection': (
+                    'earliest suspicious account appearance, then account identifier'
+                ),
+                'validation_start': self.validation_start.isoformat(),
+                'validation_end_exclusive': self.validation_end_exclusive.isoformat(),
+                'observation_graph_cutoff_exclusive': self.validation_end_exclusive.isoformat(),
+                'minimum_ring_size': self.minimum_ring_size,
+                'seed_fraction': self.seed_fraction,
+                'minimum_seed_count': self.minimum_seed_count,
+                'summary': {
+                    key: value
+                    for key, value in summary.items()
+                    if key not in {
+                        'validation_start',
+                        'validation_end_exclusive'
+                    }
+                },
+                'label_separation': (
+                    'is_laundering and laundering_type are absent from nodes.parquet and edges.parquet'
+                )
+            }
+
+            # dump manifest
+            temporary_paths['manifest'].write_text(
+                json.dumps(
+                    manifest,
+                    indent = 2
+                ),
+                encoding = 'utf-8'
+            )
+
+            # replace temporary file paths with final paths
+            for artifact_name, final_path in final_paths.items():
+                temporary_paths[artifact_name].replace(final_path)
+
+            # validate experiment
+            self.validate_experiment()
+
+        except Exception:
+            for temporary_path in temporary_paths.values():
+                # unlink temporary path
+                temporary_path.unlink(
+                    missing_ok = True
+                )
+
+            raise
+
+        return paths
