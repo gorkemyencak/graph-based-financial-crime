@@ -87,7 +87,7 @@ class SAMLDRingPersonalizedPageRank:
         ),
         'pagerank_log_count_weighted': (
             'forward',
-            'log_count_weighted'
+            'log_count_weight'
         ),
         'reverse_pagerank_unweighted': (
             'reverse',
@@ -99,7 +99,7 @@ class SAMLDRingPersonalizedPageRank:
         ),
         'reverse_pagerank_log_count_weighted': (
             'reverse',
-            'log_count_weighted'
+            'log_count_weight'
         )
     }
 
@@ -933,6 +933,219 @@ class SAMLDRingPersonalizedPageRank:
 
         return self._reset_vector
 
+    def _get_directional_reachability_mask(
+            self,
+            direction: str
+    ) -> np.ndarray:
+        """ Mark vertices reachable from at least one pooled seed """
+        # vaidate if direction is either forward or reverse
+        if not direction in ('forward', 'reverse'):
+            raise ValueError(
+                "direction must be either 'forward' or 'reverse'"
+            )
+
+        # check if self._reachability_cache is already constructed for a given direction
+        if direction in self._reachability_cache:
+            return self._reachability_cache[direction]
+
+        # build igraph
+        graph = (
+            self.build_igraph(
+                force_rebuild = False
+            )
+            if direction == 'forward'
+            else self._get_reverse_graph()
+        )
+
+        # traversal graph
+        traversal_graph = graph.copy()
+
+        # super source node id
+        super_source_node_id = traversal_graph.vcount()
+
+        # add vertex and edges to the travelsal graph
+        traversal_graph.add_vertex()
+        traversal_graph.add_edges(
+            [
+                (super_source_node_id, int(seed_node_id))
+                for seed_node_id in self._get_seed_node_ids()
+            ]
+        )
+
+        # reachable node ids
+        reachable_node_ids = np.asarray(
+            traversal_graph.subcomponent(
+                super_source_node_id,
+                mode = 'out'
+            ),
+            dtype = np.int64
+        )
+
+        # exclude reachable nodes that do not fall within graph vertex range
+        reachable_node_ids = (
+            reachable_node_ids[
+                reachable_node_ids < graph.vcount()
+            ]
+        )
+
+        # construct reachable nodes array
+        reachable_mask = np.zeros(
+            graph.vcount(),
+            dtype = bool
+        )
+
+        reachable_mask[reachable_node_ids] = True
+
+        # assign reachable nodes array to self._reachability_cache for a given direction
+        self._reachability_cache[direction] = reachable_mask
+
+        return self._reachability_cache[direction]
+
+    def _get_weak_reachability_mask(self) -> np.ndarray:
+        """ Mark vertices sharing a weak component with any pooled seed """
+        cache_key = 'weak'
+
+        # validate if self._reachability_cache is not already built for cache_key
+        if cache_key not in self._reachability_cache:
+            # build graph
+            graph = self.build_igraph(
+                force_rebuild = False
+            )
+
+            # membership for weakly connected components
+            membership = np.asarray(
+                graph.connected_components(
+                    mode = 'weak'
+                ).membership,
+                dtype = np.int64
+            )
+
+            # seed component ids
+            seed_component_ids = np.unique(
+                membership[self._get_seed_node_ids()]
+            )
+
+            # assign weak connected components to self._reachability_cache
+            self._reachability_cache[cache_key] = np.isin(
+                membership,
+                seed_component_ids
+            )
+
+        return self._reachability_cache[cache_key]
+
+    def _compute_pagerank_scores(
+            self,
+            direction: str,
+            weight_attribute: str | None,
+            personalized: bool
+    ) -> np.ndarray:
+        """ Compute and validate one ordinary or personalized score vector """
+        # build igraph
+        graph = (
+            self.build_igraph()
+            if direction == 'forward'
+            else self._get_reverse_graph()
+        )
+
+        # compute PageRank scores
+        if personalized:
+            score_values = (
+                graph.personalized_pagerank(
+                    directed = True,
+                    damping = self.damping,
+                    reset = self._build_reset_vector().tolist(),
+                    weights = weight_attribute,
+                    implementation = 'prpack'
+                )
+            )
+        else:
+            score_values = (
+                graph.pagerank(
+                    directed = True,
+                    damping = self.damping,
+                    weights = weight_attribute,
+                    implementation = 'prpack'
+                )
+            )
+
+        scores = np.asarray(
+            score_values,
+            dtype = np.float64
+        )
+
+        # validate score vector shape is consistent with graph vertex
+        if scores.shape[0] != graph.vcount():
+            raise RuntimeError(
+                'igraph returned an unexpected PageRank score shape'
+            )
+
+        # validate if scores contain all finite values
+        if not np.isfinite(scores).all():
+            raise RuntimeError(
+                'PageRank returned non-finite scores'
+            )
+
+        # validate scores are non-negative
+        if np.any(scores < 0.0):
+            raise RuntimeError(
+                'PageRank returned negative scores'
+            )
+
+        # validate sum of scores should be 1.0
+        if not np.isclose(
+            float(scores.sum()),
+            1.0,
+            rtol = 1e-8,
+            atol = 1e-10
+        ):
+            raise RuntimeError(
+                'PageRank scores must sum to 1.0'
+            )
+        
+        return scores
+
+    def _attach_target_labels(
+            self,
+            score_table: pl.DataFrame            
+    ) -> pl.DataFrame:
+        """ Attach held-out targets after scoring and exclude known seeds """
+        # target table
+        target_table = (
+            self._collect_target_table()
+            .select(
+                [
+                    'node_id',
+                    'ring_id',
+                    'target_order'
+                ]
+            )
+            .with_columns(
+                # ring target label
+                pl.lit(True)
+                .alias(
+                    'is_ring_target'
+                )
+            )
+        )
+
+        return (
+            score_table
+            .join(
+                target_table,
+                on = 'node_id',
+                how = 'left'
+            )
+            .with_columns(
+                # ring target label
+                pl.col('is_ring_target')
+                .fill_null(False)
+            )
+            .filter(
+                ~pl.col('is_seed')
+            )
+        )
+    
+
     ### public metadata and score methods
     @classmethod
     def get_ordinary_pagerank_columns(cls) -> tuple[str, ...]:
@@ -958,4 +1171,445 @@ class SAMLDRingPersonalizedPageRank:
             *cls.get_ordinary_pagerank_columns(),
             *cls.get_personalized_pagerank_columns()
         )
-        
+
+    def build_input_summary(self) -> pl.DataFrame:
+        """ Return one-row population and graph statistics """
+        # summary table
+        summaries = pl.collect_all(
+            lazy_frames = [
+                # node table
+                self.nodes
+                .select(
+                    # node count
+                    pl.len()
+                    .alias(
+                        'node_count'
+                    )
+                ),
+                # edge table
+                self.edges
+                .select(
+                    # edge count
+                    pl.len()
+                    .alias(
+                        'edge_count'
+                    )
+                ),
+                # ring table
+                self.rings
+                .select(
+                    # ring count
+                    pl.len()
+                    .alias(
+                        'ring_count'
+                    )
+                )
+            ],
+            engine = 'streaming'
+        )
+
+        # seed count
+        seed_count = (
+            self._collect_seed_table()
+            .height
+        )
+
+        # target count
+        target_count = (
+            self._collect_target_table()
+            .height
+        )
+
+        # node count
+        node_count = int(
+            summaries[0]
+            .get_column(
+                'node_count'
+            )
+            .item()
+        )
+
+        # candidate count
+        candidate_count = node_count - seed_count
+
+        return pl.DataFrame(
+            {
+                'node_count': [node_count],
+                'edge_count': [
+                    int(
+                        summaries[1]
+                        .get_column(
+                            'edge_count'
+                        )
+                        .item()
+                    )
+                ],
+                'ring_count': [
+                    int(
+                        summaries[2]
+                        .get_column(
+                            'ring_count'
+                        )
+                        .item()
+                    )
+                ],
+                'seed_count': [seed_count],
+                'candidate_count': [candidate_count],
+                'target_count': [target_count],
+                'target_rate': [
+                    target_count / candidate_count
+                ],
+                'damping': [self.damping],
+                'personalization_scheme': [self.personalization_scheme]
+            }
+        )
+
+    def build_score_table(
+            self,
+            force_recompute: bool = False
+    ) -> pl.DataFrame:
+        """ Compute graph scores without attaching targets or ring identifiers """
+        # return self._score table if it is already stored in the cache and force_recompute is False
+        if self._score_table is not None and not force_recompute:
+            return self._score_table
+
+        # construct score table
+        score_values: dict[str, np.ndarray] = {}
+
+        # 1 - Ordinary PageRank 
+        for score_name, configuration in self.ORDINARY_PAGERANK_CONFIGURATIONS.items():
+            # configuration
+            direction, weight_attribute = configuration
+
+            # compute scores
+            score_values[score_name] = self._compute_pagerank_scores(
+                direction = direction,
+                weight_attribute = weight_attribute,
+                personalized = False
+            )
+
+        # 2 - Bidirectional Ordinary PageRank
+        for score_name, source_columns in self.BIDIRECTIONAL_ORDINARY_PAGERANK_COLUMNS.items():
+            # source
+            forward_column, reverse_column = source_columns
+
+            # compute scores
+            score_values[score_name] = (
+                (score_values[forward_column] + score_values[reverse_column]) / 2.0
+            )
+
+        # 3 - Personalized PageRank
+        for score_name, configuration in self.PERSONALIZED_PAGERANK_CONFIGURATIONS.items():
+            # configuration
+            direction, weight_attribute = configuration
+
+            # compute scores
+            score_values[score_name] = self._compute_pagerank_scores(
+                direction = direction,
+                weight_attribute = weight_attribute,
+                personalized = True
+            )
+
+        # 4 - Bidirectional Personalized PageRank
+        for score_name, source_columns in self.BIDIRECTIONAL_PERSONALIZED_PAGERANK_COLUMNS.items():
+            # source
+            forward_column, reverse_column = source_columns
+
+            # compute scores
+            score_values[score_name] = (
+                (score_values[forward_column] + score_values[reverse_column]) / 2.0
+            )
+
+        # validate score values sum to 1.0
+        for score_name, scores in score_values.items():
+            if not np.isclose(
+                float(scores.sum()),
+                1.0,
+                rtol = 1e-8,
+                atol = 1e-10
+            ):
+                raise RuntimeError(
+                    f'{score_name} scores must sum to 1.0'
+                )
+
+        # score series
+        score_series = [
+            pl.Series(
+                name = score_name,
+                values = score_values[score_name],
+                dtype = pl.Float64                
+            )
+            for score_name in (
+                *self.get_ordinary_pagerank_columns(),
+                *self.get_personalized_pagerank_columns()
+            )
+        ]
+
+        # score table
+        self._score_table = (
+            self._build_base_node_table()
+            .with_columns(
+                [
+                    # in seed weak component label
+                    pl.Series(
+                        name = 'is_in_seed_weak_component',
+                        values = self._get_weak_reachability_mask(),
+                        dtype = pl.Boolean
+                    ),
+                    # forward reachable from seed label
+                    pl.Series(
+                        name = 'is_forward_reachable_from_seed',
+                        values = self._get_directional_reachability_mask(
+                            direction = 'forward'
+                        ),
+                        dtype = pl.Boolean
+                    ),
+                    # reverse reachability from seed label
+                    pl.Series(
+                        name = 'is_reverse_reachable_from_seed',
+                        values = self._get_directional_reachability_mask(
+                            direction = 'reverse'
+                        ),
+                        dtype = pl.Boolean
+                    ),
+                    # PageRank scores
+                    *score_series
+                ]
+            )
+        )
+
+        # clear candidate score table cache
+        self._candidate_score_table = None
+
+        return self._score_table
+
+    def build_candidate_score_table(
+            self,
+            force_recompute: bool = False
+    ) -> pl.DataFrame:
+        """ Attach target labels after scoring and return non-seed candidates """
+        # compute self._candidate_score_table if it is not already in the cache or force_recompute is True
+        if self._candidate_score_table is None or force_recompute:
+            self._candidate_score_table = self._attach_target_labels(
+                score_table = self.build_score_table(
+                    force_recompute = force_recompute
+                )
+            )
+
+        return self._candidate_score_table
+
+    def get_score_mass_summary(
+            self,
+            score_columns: Sequence[str] | None = None
+    ) -> pl.DataFrame:
+        """ Summarize how each score distributes mass across populations """
+        # validate score columns
+        selected_columns = self._validate_score_columns(
+            score_columns = (
+                score_columns
+                if score_columns is not None
+                else self.get_score_columns()
+            )
+        )
+
+        # candidate table
+        candidate_table = self.build_candidate_score_table(
+            force_recompute = False
+        )
+
+        # full score table
+        full_score_table = self.build_score_table(
+            force_recompute = False
+        )
+
+        # target mask
+        target_mask = np.zeros(
+            full_score_table.height,
+            dtype = bool
+        )
+
+        target_mask[self._get_target_node_ids()] = True
+
+        # labeled full score table
+        labeled_full_table = (
+            full_score_table
+            .with_columns(
+                pl.Series(
+                    name = 'is_ring_target',
+                    values = target_mask,
+                    dtype = pl.Boolean
+                )
+            )
+        )
+
+        # construct score mass summary
+        summary_rows: list[dict[str, str | float]] = []
+
+        for score_column in selected_columns:
+            # total mass
+            total_mass = float(
+                labeled_full_table
+                .get_column(
+                    score_column
+                )
+                .cast(pl.Float64)
+                .sum()
+            )
+
+            # seed mass
+            seed_mass = float(
+                labeled_full_table
+                .filter(
+                    pl.col('is_seed')
+                )
+                .get_column(
+                    score_column
+                )
+                .cast(pl.Float64)
+                .sum()
+            )
+
+            # target mass
+            target_mass = float(
+                labeled_full_table
+                .filter(
+                    'is_ring_target'
+                )
+                .get_column(
+                    score_column
+                )
+                .cast(pl.Float64)
+                .sum()
+            )
+
+            # candidate mass
+            candidate_mass = float(
+                candidate_table
+                .get_column(
+                    score_column
+                )
+                .cast(pl.Float64)
+                .sum()
+            )
+
+            summary_rows.append(
+                {
+                    'score_name': score_column,
+                    'total_score_mass': total_mass,
+                    'seed_score_mass': seed_mass,
+                    'candidate_score_mass': candidate_mass,
+                    'target_score_mass': target_mass,
+                    'target_share_of_candidate_mass': (
+                        target_mass / candidate_mass
+                        if candidate_mass > 0.0
+                        else 0.0
+                    )
+                }
+            )
+
+        return pl.DataFrame(summary_rows)
+
+    def get_candidate_score_summary(
+            self,
+            score_columns: Sequence[str] | None = None
+    ) -> pl.DataFrame:
+        """ Summarize candidate scores separately for targets and negatives """
+        # validate score columns
+        selected_columns = self._validate_score_columns(
+            score_columns = (
+                score_columns
+                if score_columns is not None
+                else self.get_score_columns()
+            )
+        )
+
+        # candidate score table
+        candidates = self.build_candidate_score_table(
+            force_recompute = False
+        )
+
+        # populations
+        populations = {
+            'all_candidates': candidates,
+            'ring_targets': candidates.filter(
+                pl.col('is_ring_target')
+            ),
+            'non_targets': candidates.filter(
+                ~pl.col('is_ring_target')
+            )
+        }
+
+        # construct candidate score summary
+        summary_rows: list[dict[str, str | int | float]] = []
+
+        for score_column in selected_columns:
+            for population_name, population in populations.items():
+                # check whether provided population is empty 
+                if population.is_empty():
+                    summary_rows.append(
+                        {
+                            'score_name': score_column,
+                            'population': population_name,
+                            'account_count': 0,
+                            'minimum': float('nan'),
+                            'mean': float('nan'),
+                            'median': float('nan'),
+                            'p95': float('nan'),
+                            'p99': float('nan'),
+                            'maximum': float('nan'),
+                            'zero_share': float('nan')
+                        }
+                    )
+
+                    continue
+
+                # population score values
+                score_values = (
+                    population
+                    .get_column(
+                        score_column
+                    )
+                    .cast(pl.Float64)
+                    .to_numpy()
+                    .astype(
+                        dtype = np.float64,
+                        copy = False
+                    )
+                )
+
+                summary_rows.append(
+                    {
+                        'score_name': score_column,
+                        'population': population_name,
+                        'account_count': population.height,
+                        'minimum': float(
+                            np.min(score_values)
+                        ),
+                        'mean': float(
+                            np.mean(score_values)
+                        ),
+                        'median': float(
+                            np.median(score_values)
+                        ),
+                        'p95': float(
+                            np.quantile(
+                                score_values,
+                                q = 0.95
+                            )
+                        ),
+                        'p99': float(
+                            np.quantile(
+                                score_values,
+                                q = 0.99
+                            )
+                        ),
+                        'maximum': float(
+                            np.max(score_values)
+                        ),
+                        'zero_share': float(
+                            np.mean(score_values == 0)
+                        )
+                    }
+                )
+
+        return pl.DataFrame(summary_rows)
