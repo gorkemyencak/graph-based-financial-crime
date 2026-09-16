@@ -1613,3 +1613,683 @@ class SAMLDRingPersonalizedPageRank:
                 )
 
         return pl.DataFrame(summary_rows)
+
+    ### public evaluation methods
+    def evaluate_global_rankings(
+            self,
+            k_values: Sequence[int] = (
+                100,
+                500,
+                1_000,
+                5_000,
+                10_000
+            ),
+            score_columns: Sequence[str] | None = None
+    ) -> pl.DataFrame:
+        """
+        Evaluate candidate rankings using binary held-out target labels
+
+        Ties are resolved deterministically by ascending node IDs
+        """
+        # validate score columns
+        selected_columns = self._validate_score_columns(
+            score_columns = (
+                score_columns
+                if score_columns is not None
+                else self.get_score_columns()
+            )
+        )
+
+        # validate k_values
+        selected_k_values = self._validate_k_values(
+            k_values = k_values
+        )
+
+        # candidates score table
+        candidates = self.build_candidate_score_table(
+            force_recompute = False 
+        )
+
+        # validate if candidates score table is empty
+        if candidates.is_empty():
+            raise ValueError(
+                'Global ranking evaluation requires candidates'
+            )
+
+        # candidates count
+        candidate_count = candidates.height
+
+        # target count
+        target_count = int(
+            candidates
+            .get_column(
+                'is_ring_target'
+            )
+            .sum()
+        )
+
+        # validate if target count is null
+        if target_count == 0:
+            raise ValueError(
+                'Global ranking evaluation requires held-out targets'
+            )
+
+        # target rate
+        target_rate = (
+            target_count / candidate_count
+        )
+
+        # global evaluation scores
+        evaluation_rows: list[dict[str, str | int | float]] = []
+
+        for score_column in selected_columns:
+            # ranked labels
+            ranked_labels = (
+                candidates
+                .sort(
+                    [
+                        score_column,
+                        'node_id'
+                    ],
+                    descending = [
+                        True,
+                        False
+                    ]
+                )
+                .get_column(
+                    'is_ring_target'
+                )
+                .to_numpy()
+                .astype(
+                    dtype = np.int8,
+                    copy = False
+                )
+            )
+
+            for requested_k in selected_k_values:
+                # effective k value
+                effective_k = min(
+                    requested_k,
+                    candidate_count
+                )
+
+                # top labels
+                top_labels = ranked_labels[:effective_k]
+
+                # hit count
+                hit_count = int(
+                    top_labels.sum()
+                )
+
+                # evaluation metrics
+                precision_at_k = (
+                    hit_count / effective_k
+                )
+
+                recall_at_k = (
+                    hit_count / target_count
+                )
+
+                lift_at_k = (
+                    precision_at_k / target_rate
+                )
+
+                discounts = (
+                    1.0
+                    /
+                    np.log2(
+                        np.arange(
+                            2,
+                            effective_k + 2
+                        )
+                    )
+                )
+
+                dcg_at_k = float(
+                    np.dot(
+                        top_labels,
+                        discounts
+                    )
+                )
+
+                ideal_hit_count = min(
+                    target_count,
+                    effective_k
+                )
+
+                ideal_dcg_at_k = float(
+                    discounts[:ideal_hit_count]
+                    .sum()
+                )
+
+                ndcg_at_k = (
+                    dcg_at_k / ideal_dcg_at_k
+                    if ideal_dcg_at_k > 0.0
+                    else 0.0
+                )
+
+                evaluation_rows.append(
+                    {
+                        'score_name': score_column,
+                        'requested_k': requested_k,
+                        'effective_k': effective_k,
+                        'candidate_count': candidate_count,
+                        'target_count': target_count,
+                        'target_rate': target_rate,
+                        'hit_count': hit_count,
+                        'precision_at_k': precision_at_k,
+                        'recall_at_k': recall_at_k,
+                        'lift_at_k': lift_at_k,
+                        'ndcg_at_k': ndcg_at_k
+                    }
+                )
+
+        return pl.DataFrame(evaluation_rows)
+
+    def evaluate_target_ranks(
+            self,
+            score_columns: Sequence[str] | None = None
+    ) -> pl.DataFrame:
+        """ Evaluate complete-ranking target positions, average precision, and mean reciprocal rank """
+        # validate score columns
+        selected_columns = self._validate_score_columns(
+            score_columns = (
+                score_columns
+                if score_columns is not None
+                else self.get_score_columns()
+            )
+        )
+
+        # candidates score table
+        candidates = self.build_candidate_score_table()
+
+        # candidate count
+        candidate_count = candidates.height
+
+        # target count
+        target_count = int(
+            candidates
+            .get_column(
+                'is_ring_target'
+            )
+            .sum()
+        )
+
+        # target rank summary
+        result_rows: list[dict[str, str | int | float]] = []
+
+        for score_column in selected_columns:
+            # ranked labels
+            ranked_labels = (
+                candidates
+                .sort(
+                    [
+                        score_column,
+                        'node_id'
+                    ],
+                    descending = [
+                        True,
+                        False
+                    ]
+                )
+                .get_column(
+                    'is_ring_target'
+                )
+                .to_numpy()
+                .astype(
+                    bool,
+                    copy = False
+                )
+            )
+
+            # target ranks
+            target_ranks = np.flatnonzero(ranked_labels) + 1
+
+            # validate target_ranks size
+            if target_ranks.size != target_count:
+                raise RuntimeError(
+                    'Target-rank extraction produced an unexpected count'
+                )
+
+            # evaluation metric
+            precision_at_target_ranks = (
+                np.arange(
+                    1,
+                    target_count + 1,
+                    dtype = np.float64
+                )
+                /
+                target_ranks
+            )
+
+            result_rows.append(
+                {
+                    'score_name': score_column,
+                    'candidate_count': candidate_count,
+                    'target_count': target_count,
+                    'best_target_rank': int(
+                        target_ranks.min()
+                    ),
+                    'median_target_rank': float(
+                        np.median(target_ranks)
+                    ),
+                    'mean_target_rank': float(
+                        target_ranks.mean()
+                    ),
+                    'p90_target_rank': float(
+                        np.quantile(
+                            target_ranks,
+                            q = 0.90
+                        )
+                    ),
+                    'worst_target_rank': int(
+                        target_ranks.max()
+                    ),
+                    'median_target_rank_share': float(
+                        np.median(target_ranks) / candidate_count
+                    ),
+                    'mean_reciprocal_rank': float(
+                        1.0 / target_ranks.min()
+                    ),
+                    'average_precision': float(
+                        precision_at_target_ranks.mean()
+                    )
+                }
+            )
+        
+        return pl.DataFrame(result_rows)
+
+    def build_ring_recovery_table(
+            self,
+            score_column: str,
+            k_value: int
+    ) -> pl.DataFrame:
+        """ Return per-ring recovery statistics within a global top-k list """
+        # validate score column
+        selected_score = self._validate_score_columns(
+            score_columns = score_column
+        )[0]
+
+        # validate k_value non-negativity
+        self._validate_positive_integer(
+            value = k_value,
+            parameter_name = 'k_value'
+        )
+
+        # candidates score table
+        candidates = self.build_candidate_score_table()
+
+        # effective k
+        effective_k = min(
+            candidates.height,
+            k_value
+        )
+
+        # ranked candidates
+        ranked_candidates = (
+            candidates
+            .sort(
+                [
+                    selected_score,
+                    'node_id'
+                ],
+                descending = [
+                    True,
+                    False
+                ]
+            )
+            .with_row_index(
+                name = 'global_rank',
+                offset = 1
+            )
+        )
+
+        # recovered targets
+        recovered_targets = (
+            ranked_candidates
+            .head(
+                effective_k
+            )
+            .filter(
+                pl.col('is_ring_target')
+            )
+            .group_by(
+                'ring_id'
+            )
+            .agg(
+                [
+                    # recovered target count
+                    pl.len()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'recovered_target_count'
+                    ),
+                    # first recovered global rank
+                    pl.col('global_rank')
+                    .min()
+                    .cast(pl.UInt64)
+                    .alias(
+                        'first_recovered_global_rank'
+                    )
+                ]
+            )
+        )
+
+        # ring targets
+        ring_targets = (
+            self.rings
+            .select(
+                [
+                    'ring_id',
+                    'ring_size',
+                    'seed_count',
+                    'target_count'
+                ]
+            )
+            .collect(
+                engine = 'streaming'
+            )
+        )
+
+        return (
+            ring_targets
+            .join(
+                recovered_targets,
+                on = 'ring_id',
+                how = 'left'
+            )
+            .with_columns(
+                pl.col('recovered_target_count')
+                .fill_null(0)
+                .cast(pl.UInt64)
+            )
+            .with_columns(
+                [
+                    # ring target recall
+                    (
+                        pl.col('recovered_target_count') / pl.col('target_count')
+                    )
+                    .cast(pl.Float64)
+                    .alias(
+                        'ring_target_recall'
+                    ),
+                    # ring hit label
+                    (
+                        pl.col('recovered_target_count') > 0
+                    )
+                    .alias(
+                        'is_ring_hit'
+                    ),
+                    # fully recovered ring label
+                    (
+                        pl.col('recovered_target_count') == pl.col('target_count')
+                    )
+                    .alias(
+                        'is_fully_recovered_ring'
+                    )
+                ]
+            )
+            .with_columns(
+                [
+                    # score name
+                    pl.lit(selected_score)
+                    .alias(
+                        'score_name'
+                    ),
+                    # requested k
+                    pl.lit(k_value)
+                    .alias(
+                        'requested_k'
+                    ),
+                    # effective k
+                    pl.lit(effective_k)
+                    .alias(
+                        'effective_k'
+                    )
+                ]
+            )
+            .select(
+                [
+                    'score_name',
+                    'requested_k',
+                    'effective_k',
+                    'ring_id',
+                    'ring_size',
+                    'seed_count',
+                    'target_count',
+                    'recovered_target_count',
+                    'ring_target_recall',
+                    'is_ring_hit',
+                    'is_fully_recovered_ring',
+                    'first_recovered_global_rank'
+                ]
+            )
+            .sort(
+                [
+                    'ring_target_recall',
+                    'first_recovered_global_rank',
+                    'ring_id'
+                ],
+                descending = [
+                    True,
+                    False,
+                    False
+                ],
+                nulls_last = True
+            )
+        )
+
+    def evaluate_ring_recovery(
+            self,
+            k_values: Sequence[int] = (
+                100,
+                00,
+                1_000,
+                5_000,
+                10_000
+            ),
+            score_columns: Sequence[str] | None = None
+    ) -> pl.DataFrame:
+        """ Evaluate macro ring recovery within global candidate rankings """
+        # validate score columns
+        selected_columns = self._validate_score_columns(
+            score_columns = (
+                score_columns
+                if score_columns is not None
+                else self.get_score_columns()
+            )
+        )
+
+        # validate k_values
+        selected_k_values = self._validate_k_values(
+            k_values = k_values
+        )
+
+        # candidate count
+        candidate_count = (
+            self.build_candidate_score_table()
+            .height
+        )
+
+        # validate candidate count
+        if candidate_count == 0:
+            raise ValueError(
+                'There are no candidates to rank'
+            )
+
+        # ring recovery evaluation summary
+        summary_rows: list[dict[str, str | int | float]] = []
+
+        for score_column in selected_columns:
+            for k_value in selected_k_values:
+                # recovery table
+                recovery_table = self.build_ring_recovery_table(
+                    score_column = score_column,
+                    k_value = k_value
+                )
+
+                # effectve k
+                effective_k = min(
+                    candidate_count,
+                    k_value
+                )
+
+                # ring count
+                ring_count = recovery_table.height
+
+                # ring hit count
+                ring_hit_count = int(
+                    recovery_table
+                    .get_column(
+                        'is_ring_hit'
+                    )
+                    .sum()
+                )
+
+                # fully recovered ring count
+                fully_recovered_ring_count = int(
+                    recovery_table
+                    .get_column(
+                        'is_fully_recovered_ring'
+                    )
+                    .sum()
+                )
+
+                # recovered target count
+                recovered_target_count = int(
+                    recovery_table
+                    .get_column(
+                        'recovered_target_count'
+                    )
+                    .sum()
+                )
+
+                # ring recall array
+                ring_recall_values = np.asarray(
+                    recovery_table
+                    .get_column('ring_target_recall')
+                    .to_numpy()
+                    .astype(
+                        dtype = np.float64,
+                        copy = False
+                    )
+                )
+
+                # first hit ranks
+                first_hit_ranks = (
+                    recovery_table
+                    .get_column('first_recovered_global_rank')
+                    .drop_nulls()
+                    .to_numpy()
+                    .astype(
+                        dtype = np.float64,
+                        copy = False
+                    )
+                )
+
+                # mean & median ring target recall
+                mean_ring_target_recall = float(
+                    np.mean(
+                        ring_recall_values
+                    )
+                )
+
+                median_ring_target_recall = float(
+                    np.median(
+                        ring_recall_values
+                    )
+                )
+
+                # mean first hit rank
+                mean_first_hit_rank = (
+                    float(
+                        np.mean(
+                            first_hit_ranks
+                        )
+                    )
+                    if first_hit_ranks.size > 0
+                    else float('nan')
+                )
+
+                summary_rows.append(
+                    {
+                        'score_name': score_column,
+                        'requested_k': k_value,
+                        'effective_k': effective_k,
+                        'ring_count': ring_count,
+                        'recovered_target_count': recovered_target_count,
+                        'ring_hit_count': ring_hit_count,
+                        'ring_hit_rate': (
+                            ring_hit_count / ring_count
+                        ),
+                        'fully_recovered_ring_count': fully_recovered_ring_count,
+                        'fully_recovered_ring_rate': (
+                            fully_recovered_ring_count / ring_count
+                        ),
+                        'mean_ring_target_recall': mean_ring_target_recall,
+                        'median_ring_target_recall': median_ring_target_recall,
+                        'mean_first_hit_rank': mean_first_hit_rank
+                    }
+                )
+
+        return pl.DataFrame(summary_rows)
+
+    def get_top_ranked_accounts(
+            self,
+            score_column: str,
+            top_n: int = 20
+    ) -> pl.DataFrame:
+        """ Return the highest-ranked non-seed candidate accounts """
+        # validate score column
+        selected_score = self._validate_score_columns(
+            score_columns = score_column
+        )[0]
+
+        # validate top_n non-negativity
+        self._validate_positive_integer(
+            value = top_n,
+            parameter_name = 'top_n' 
+        )
+
+        return (
+            self.build_candidate_score_table()
+            .sort(
+                [
+                    selected_score,
+                    'node_id'
+                ],
+                descending = [
+                    True,
+                    False
+                ]
+            )
+            .with_row_index(
+                name = 'global_rank',
+                offset = 1
+            )
+            .select(
+                [
+                    'global_rank',
+                    'node_id',
+                    'account',
+                    selected_score,
+                    'is_ring_target',
+                    'ring_id',
+                    'target_order',
+                    'out_degree',
+                    'in_degree',
+                    'total_directed_degree',
+                    'account_transaction_event_count',
+                    'is_in_seed_weak_component',
+                    'is_forward_reachable_from_seed',
+                    'is_reverse_reachable_from_seed'
+                ]
+            )
+            .head(
+                n = top_n
+            )
+        )
+          
+
+
+    
