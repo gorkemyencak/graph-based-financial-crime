@@ -2289,7 +2289,144 @@ class SAMLDRingPersonalizedPageRank:
                 n = top_n
             )
         )
-          
 
+    ### public score persistence methods
+    def validate_score_file(
+            self,
+            output_path: Path | str
+    ) -> None:
+        """ Validate a persisted label-free score table """
+        # ensure score path is a path instance
+        score_path = Path(output_path)
 
-    
+        # validate whether score file exists
+        if not score_path.is_file():
+            raise FileNotFoundError(
+                f'Personalized PageRank score file does not exists: {score_path}'
+            )
+
+        # validate if score file is empty on disk
+        if score_path.stat().st_size == 0:
+            raise ValueError(
+                f'Personalized PageRank score file is empty: {score_path}'
+            )
+
+        # extract the actual columns from the Parquet score file
+        actual_columns = set(
+            pl.scan_parquet(source = score_path)
+            .collect_schema()
+            .names()
+        )
+
+        # expeected score file columns
+        expected_columns = {
+            'node_id',
+            'account',
+            'is_seed',
+            *self.get_score_columns()
+        }
+
+        # missing columns
+        missing_columns = expected_columns - actual_columns
+
+        # return sorted missing columns if present
+        if missing_columns:
+            sorted_missing_columns = ', '.join(
+                sorted(missing_columns)
+            )
+
+            raise ValueError(
+                f'Persisted score table is missing columns: {sorted_missing_columns}'
+            )
+
+        # forbidden columns to prevent leakage
+        forbidden_columns = {
+            'ring_id',
+            'target_order',
+            'is_ring_target'
+        }
+
+        # leaked columns that are found in the actual columns
+        leaked_columns = forbidden_columns & actual_columns
+
+        # return sorted leaked columns if present
+        if leaked_columns:
+            sorted_leaked_columns = ', '.join(
+                sorted(leaked_columns)
+            )
+
+            raise ValueError(
+                f'Persisted score table containes evaluation labels: {sorted_leaked_columns}'
+            )
+
+    def write_score_table(
+            self,
+            output_path: Path | str,
+            overwrite: bool = False
+    ) -> Path:
+        """ Persist the label-free node score table atomically """
+        # validate overwrite instance type
+        if not isinstance(overwrite, bool):
+            raise TypeError(
+                'overwrite must be a boolean instance'
+            )
+
+        # ensure score path is a path instance
+        score_path = Path(output_path)
+
+        # validate score path
+        if score_path.exists() and not overwrite:
+            self.validate_score_file(
+                output_path = score_path
+            )
+
+            return score_path
+
+        # create score path directory
+        score_path.parent.mkdir(
+            parents = True,
+            exist_ok = True 
+        )
+
+        # temporary path
+        temporary_path = score_path.with_name(
+            f'.{score_path.stem}.tmp{score_path.suffix}'
+        )
+
+        # unlink the temporary path
+        temporary_path.unlink(
+            missing_ok = True
+        )
+
+        try:
+            # build score table, and write to parquet
+            self.build_score_table().write_parquet(
+                file = temporary_path,
+                compression = 'zstd',
+                statistics = True
+            )
+
+            # validate score file
+            self.validate_score_file(
+                output_path = temporary_path
+            )
+
+            # replace temporary path with final path after validation
+            temporary_path.replace(
+                target = score_path
+            )
+
+            # validate final path
+            self.validate_score_file(
+                output_path = score_path
+            )
+
+        except Exception:
+            # unlink the temporary path
+            temporary_path.unlink(
+                missing_ok = True
+            )
+
+            raise
+
+        return score_path
