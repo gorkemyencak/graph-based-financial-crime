@@ -24,7 +24,7 @@ class SAMLDRingCaseAnalyzer:
             'node_id',
             'out_degree',
             'in_degree',
-            'account_transaction_count'
+            'account_transaction_event_count'
         },
         'edges': {
             'source_node_id',
@@ -37,7 +37,7 @@ class SAMLDRingCaseAnalyzer:
             'seed_count',
             'target_count'
         },
-        'ring_account': {
+        'ring_accounts': {
             'ring_id',
             'node_id',
             'account',
@@ -265,14 +265,758 @@ class SAMLDRingCaseAnalyzer:
 
             result.append(
                 (
+                    # forward hop
                     int(forward_min)
                     if np.isfinite(forward_min)
                     else None,
+                    # reverse hop
                     int(reverse_min)
                     if np.isfinite(reverse_min)
                     else None,
                 )
             )
 
-        return result      
+        return result
 
+    ### public evaluation methods
+    def build_target_rank_table(self) -> pl.DataFrame:
+        """ Sort non-seed accounts first, then attach withheld target labels """
+        # return target ranks if it is already stored in the cache
+        if self._target_ranks is not None:
+            return self._target_ranks
+
+        # candidate scores based on non-seed accounts
+        candidates = self._get_candidate_scores()
+
+        # ranked targets
+        ranked_targets = (
+            self.targets
+            .select(
+                [
+                    'ring_id',
+                    'node_id',
+                    'account',
+                    'target_order'
+                ]
+            )
+        )
+
+        for direction, score_name in self.SCORE_COLUMNS.items():
+            # ranked candidates
+            ranked_candidates = (
+                candidates
+                .select(
+                    [
+                        'node_id',
+                        score_name
+                    ]
+                )
+                .sort(
+                    [
+                        score_name,
+                        'node_id'
+                    ],
+                    descending = [
+                        True,
+                        False
+                    ]
+                )
+                .with_row_index(
+                    name = f'{direction}_rank', 
+                    offset = 1
+                )
+                .rename(
+                    {
+                        score_name: f'{direction}_score'
+                    }
+                )
+            )
+
+            # update ranked targets with direction scores
+            ranked_targets = (
+                ranked_targets
+                .join(
+                    ranked_candidates,
+                    on = 'node_id',
+                    how = 'left'
+                )
+            )
+
+        # ensure that none of targets are absent from candidate rankings
+        if ranked_targets.select(
+            pl.any_horizontal(
+                pl.all()
+                .is_null()
+            )
+            .any()
+        ).item():
+            raise ValueError(
+                'A withheld target is absent from the candidate rankings'
+            )
+
+        # store in the cache
+        self._target_ranks = (
+            ranked_targets
+            .sort(
+                [
+                    'ring_id',
+                    'target_order'
+                ]
+            )
+        )
+
+        return self._target_ranks
+
+    def build_ring_comparison(self) -> pl.DataFrame:
+        """ Count each ring's targets in the global top-k of three rankings """
+        # return ring comparison if it is already stored in the cache
+        if self._ring_comparison is not None:
+            return self._ring_comparison
+
+        # target rank table
+        target_ranks = self.build_target_rank_table()
+
+        # target rank table grouped by ring ids
+        grouped_target_ranks = (
+            target_ranks
+            .group_by(
+                'ring_id'
+            )
+            .agg(
+                [
+                    # direction hits
+                    (
+                        pl.col(f'{direction}_rank') <= self.k
+                    )
+                    .sum()
+                    .alias(
+                        f'{direction}_hits'
+                    )
+                    for direction in self.SCORE_COLUMNS
+                ]
+                +
+                [
+                    # direction first rank
+                    pl.col(f'{direction}_rank')
+                    .min()
+                    .alias(
+                        f'{direction}_first_rank'
+                    )
+                    for direction in self.SCORE_COLUMNS
+                ]
+            )
+        )
+
+        # ring comparison table
+        ring_comparison = (
+            self.rings
+            .select(
+                [
+                    'ring_id',
+                    'ring_size',
+                    'seed_count',
+                    'target_count'
+                ]
+            )
+            .join(
+                grouped_target_ranks,
+                on = 'ring_id',
+                how = 'left'
+            )
+            .with_columns(
+                # blend gain
+                (
+                    pl.col('bidirectional_hits').cast(pl.Int64) - pl.col('forward_hits').cast(pl.Int64)
+                )
+                .alias(
+                    'blend_gain'
+                ),
+                # forward ring recall
+                (
+                    pl.col('forward_hits') / pl.col('target_count')
+                )
+                .alias(
+                    'forward_ring_recall'
+                ),
+                # bidirectional ring recall
+                (
+                    pl.col('bidirectional_hits') / pl.col('target_count')
+                )
+                .alias(
+                    'bidirectional_ring_recall'
+                )
+            )
+            .with_columns(
+                # forward status: complete, partial or missed
+                pl.when(
+                    pl.col('forward_hits') == pl.col('target_count')
+                )
+                .then(
+                    pl.lit('complete')
+                )
+                .when(
+                    pl.col('forward_hits') > 0
+                )
+                .then(
+                    pl.lit('partial')
+                )
+                .otherwise(
+                    pl.lit('missed')
+                )
+                .alias(
+                    'forward_status'
+                )
+            )
+            .sort(
+                'ring_id'
+            )
+        )
+
+        # store in the cache
+        self._ring_comparison = ring_comparison
+
+        return self._ring_comparison
+
+    def select_representative_cases(self) -> pl.DataFrame:
+        """ Select distinct success, blend-gain, reverse-rescue, and missed rings """
+        # ring comparison summary
+        summary = self.build_ring_comparison()
+
+        # scenarios: case type, condition, sort columns, descending
+        scenarios = [
+            (
+                'forward_complete',
+                pl.col('forward_hits') == pl.col('target_count'),
+                ['target_count', 'forward_first_rank', 'ring_id'],
+                [True, False, False]
+            ),
+            (
+                'blend_gain',
+                pl.col('blend_gain') > 0,
+                ['blend_gain', 'bidirectional_hits', 'ring_id'],
+                [True, True, False]
+            ),
+            (
+                'reverse_rescue',
+                (pl.col('forward_hits') == 0) & (pl.col('reverse_hits') > 0),
+                ['reverse_hits', 'ring_id'],
+                [True, False]
+            ),
+            (
+                'missed_by_all',
+                (pl.col('forward_hits') == 0) & (pl.col('reverse_hits') == 0) & (pl.col('bidirectional_hits') == 0),
+                ['target_count', 'ring_id'],
+                [True, False]
+            )
+        ]
+
+        # selected case scenarios
+        chosen: list[dict[str, object]] = []
+        used: set[int] = set()
+
+        for case_type, condition, sort_columns, descending in scenarios:
+
+            # filtered & sorted ring comparison summary
+            filtered_summary = (
+                summary
+                .filter(
+                    condition
+                    & ~pl.col('ring_id').is_in(sorted(used))
+                )
+                .sort(
+                    by = sort_columns,
+                    descending = descending
+                )
+            )
+
+            # validate if filtered ring comparison summary is empty
+            if filtered_summary.is_empty():
+                continue
+
+            filtered_summary_row = filtered_summary.row(
+                index = 0,
+                named = True
+            )
+
+            # add ring_id to 'used' set
+            used.add(
+                int(filtered_summary_row['ring_id'])
+            )
+
+            # append case type and row values to 'chosen' list
+            chosen.append(
+                {
+                    'case_type': case_type,
+                    **filtered_summary_row
+                }
+            )
+
+        # validate whether 'chosen' list is empty
+        if not chosen:
+            raise ValueError(
+                'No rings available for the selected case scenarios'
+            )
+
+        return pl.DataFrame(chosen)
+
+    def build_igraph(self) -> ig.Graph:
+        """ Load the observation graph once, only for case path tracing """
+        # validate if graph is not stored in the cache yet
+        if self._graph is None:
+            # node count
+            node_count = int(
+                self.nodes
+                .select(
+                    pl.len()
+                )
+                .collect()
+                .item()
+            )
+
+            # edge table
+            edge_table = (
+                self.edges
+                .select(
+                    [
+                        'source_node_id',
+                        'target_node_id'
+                    ]
+                )
+                .collect(
+                    engine = 'streaming'
+                )
+            )
+
+            # endpoints
+            endpoints = edge_table.iter_rows()
+
+            # store graph object in the cache
+            self._graph = ig.Graph(
+                n = node_count,
+                edges = list(endpoints),
+                directed = True
+            )
+
+        return self._graph
+
+    def get_ring_edges(
+            self,
+            ring_id: int
+    ) -> pl.DataFrame:
+        """ Get observation edges whose two endpoints are ring members """
+        # member ids of a particular ring id
+        member_ids = (
+            self._members(
+                ring_id = ring_id
+            )
+            .get_column(
+                'node_id'
+            )
+            .to_list()
+        )
+
+        return (
+            self.edges
+            .filter(
+                pl.col('source_node_id').is_in(member_ids)
+                & pl.col('target_node_id').is_in(member_ids)
+            )
+            .select(
+                [
+                    'source_node_id',
+                    'target_node_id',
+                    'count_weight'
+                ]
+            )
+            .collect(
+                engine = 'streaming'
+            )
+        )
+
+    def build_same_ring_path_table(
+            self,
+            ring_ids: Sequence[int]
+    ) -> pl.DataFrame:
+        """  
+        Trace selected target paths from the seeds of their own ring
+
+        Whole-graph paths may use intermediary nodes outside the ring. Paths computed on the induced graph stay 
+        strictly within its member accounts. No ring-specific PageRank computation is performed        
+        """
+        # unique ring ids
+        unique_ring_ids = list(
+            dict.fromkeys(
+                int(ring_id)
+                for ring_id in ring_ids
+            )
+        )
+
+        # validate if unique ring ids is empty
+        if not unique_ring_ids:
+            raise ValueError(
+                'Choose at least one ring_id'
+            )
+
+        # build igraph
+        graph = self.build_igraph()
+
+        # target rank table
+        rank_table = self.build_target_rank_table()
+
+        # construct same ring path table
+        rows: list[dict[str, int | bool | None]] = []
+
+        for ring_id in unique_ring_ids:
+            # ring members
+            members = self._members(
+                ring_id = ring_id
+            )
+
+            # ring member ids
+            member_ids = [
+                int(node_id)
+                for node_id in members['node_id'].to_list()
+            ]
+            
+            # seed ids
+            seed_ids = [
+                int(node_id)
+                for node_id in (
+                    self.seeds
+                    .filter(
+                        pl.col('ring_id') == ring_id
+                    )
+                    .get_column(
+                        'node_id'
+                    )
+                    .to_list()
+                )
+            ]
+
+            # ring targets
+            ring_targets = (
+                self.targets
+                .filter(
+                    pl.col('ring_id') == ring_id
+                )
+            )
+
+            # target ids
+            target_ids = [
+                int(node_id)
+                for node_id in ring_targets['node_id'].to_list()
+            ]
+
+            # validate if seed_ids and target_ids is empty
+            if not seed_ids or not target_ids:
+                raise ValueError(
+                    f'Ring {ring_id} has no seeds or no targets'
+                )
+
+            # global paths
+            global_paths = self._distance_pairs(
+                graph = graph,
+                sources = seed_ids,
+                targets = target_ids
+            )
+
+            # local index
+            local_index = {
+                node_id: index
+                for index, node_id in enumerate(member_ids)
+            }
+
+            # ring member edges
+            member_edges = self.get_ring_edges(
+                ring_id = ring_id
+            )
+
+            # local graph
+            local_graph = ig.Graph(
+                n = len(member_ids),
+                edges = [
+                    (local_index[int(source)], local_index[int(target)])
+                    for source, target, _ in member_edges.iter_rows()
+                ],
+                directed = True
+            )
+
+            # local paths
+            local_paths = self._distance_pairs(
+                graph = local_graph,
+                sources = [
+                    local_index[node_id]
+                    for node_id in seed_ids
+                ],
+                targets = [
+                    local_index[node_id]
+                    for node_id in target_ids
+                ]
+            )
+
+            # generate path table row for each ring_id
+            for node_id, global_pair, local_pair in zip(
+                target_ids,
+                global_paths,
+                local_paths,
+                strict = True
+            ):
+                rows.append(
+                    {
+                        'ring_id': ring_id,
+                        'node_id': node_id,
+                        'full_forward_hops': global_pair[0],
+                        'full_reverse_hops': global_pair[1],
+                        'within_ring_forward_hops': local_pair[0],
+                        'within_ring_reverse_hops': local_pair[1]
+                    }
+                )
+
+        # path table
+        path_table = pl.DataFrame(rows)
+
+        return (
+            rank_table
+            .join(
+                path_table,
+                on = [
+                    'ring_id',
+                    'node_id'
+                ],
+                how = 'inner'
+            )
+            .with_columns(
+                [
+                    # forward hit
+                    (
+                        pl.col('forward_rank') <= self.k
+                    )
+                    .alias(
+                        'forward_hit'
+                    ),
+                    # reverse hit
+                    (
+                        pl.col('reverse_rank') <= self.k
+                    )
+                    .alias(
+                        'reverse_hit'
+                    ),
+                    # bidirectional hit
+                    (
+                        pl.col('bidirectional_rank') <= self.k
+                    )
+                    .alias(
+                        'bidirectional_hit'
+                    ),
+                    # own seed forward path
+                    pl.col('full_forward_hops')
+                    .is_not_null()
+                    .alias(
+                        'own_seed_forward_path'
+                    ),
+                    # own seed reverse path
+                    pl.col('full_reverse_hops')
+                    .is_not_null()
+                    .alias(
+                        'own_seed_reverse_path'
+                    ),
+                    # own seed forward path within ring
+                    pl.col('within_ring_forward_hops')
+                    .is_not_null()
+                    .alias(
+                        'own_seed_forward_path_within_ring'
+                    ),
+                    # own seed reverse path within ring
+                    pl.col('within_ring_reverse_hops')
+                    .is_not_null()
+                    .alias(
+                        'own_seed_reverse_path_within_ring'
+                    )
+                ]
+            )
+            .sort(
+                [
+                    'ring_id',
+                    'target_order'
+                ]
+            )
+        )
+    
+    def get_ring_nodes(
+            self,
+            ring_id: int
+    ) -> pl.DataFrame:
+        """ Return roles, activity, scores, and global ranks of ring members """
+        # ring members
+        members = self._members(
+            ring_id = ring_id
+        )
+
+        # ring member ids
+        member_ids = members['node_id'].to_list()
+
+        # ring member activity
+        activity = (
+            self.nodes
+            .filter(
+                pl.col('node_id').is_in(member_ids)
+            )
+            .select(
+                [
+                    'node_id',
+                    'in_degree',
+                    'out_degree',
+                    'account_transaction_event_count'
+                ]
+            )
+            .collect(
+                engine = 'streaming'
+            )
+        )
+
+        # ring member scores
+        scores = (
+            self.scores
+            .filter(
+                pl.col('node_id').is_in(member_ids)
+            )
+            .drop('is_seed')
+            .collect(
+                engine = 'streaming'
+            )
+        )
+
+        # target rank table
+        ranks = (
+            self.build_target_rank_table()
+            .select(
+                [
+                    'node_id',
+                    'forward_rank',
+                    'reverse_rank',
+                    'bidirectional_rank'
+                ]
+            )
+        )
+
+        return (
+            members
+            .select(
+                [
+                    'ring_id',
+                    'node_id',
+                    'account',
+                    'ring_member_order',
+                    'is_ring_seed',
+                    'is_ring_target'
+                ]
+            )
+            .join(
+                activity,
+                on = 'node_id',
+                how = 'left'
+            )
+            .join(
+                scores,
+                on = 'node_id',
+                how = 'left'
+            )
+            .join(
+                ranks,
+                on = 'node_id',
+                how = 'left'
+            )
+            .sort(
+                'ring_member_order'
+            )
+        )
+
+    def get_top_non_targets(
+            self,
+            top_n: int = 10
+    ) -> pl.DataFrame:
+        """ Inspect high-ranked accounts outside the held-out target set """
+        # validate whether top_n is an integer instance or non-negative
+        if isinstance(top_n, int) or top_n <= 0:
+            raise ValueError(
+                'top_n must be a positive integer'
+            )
+
+        # forward score column
+        forward_score = self.SCORE_COLUMNS['forward']
+
+        # ranked candidate scores of forward score column
+        ranked_candidates = (
+            self._get_candidate_scores()
+            .sort(
+                [
+                    forward_score,
+                    'node_id'
+                ],
+                descending = [
+                    True,
+                    False
+                ]
+            )
+            .with_row_index(
+                name = 'global_rank',
+                offset = 1
+            )
+        )
+
+        # ranked candidates not listed in targets
+        ranked_candidates_non_targets = (
+            ranked_candidates
+            .join(
+                self.targets
+                .select(
+                    'node_id'
+                ),
+                on = 'node_id',
+                how = 'anti'
+            )
+            .sort(
+                'global_rank'
+            )
+            .head(
+                top_n
+            )
+        )
+
+        return (
+            ranked_candidates_non_targets
+            .join(
+                self.nodes
+                .select(
+                    [
+                        'node_id',
+                        'account',
+                        'in_degree',
+                        'out_degree',
+                        'account_transaction_event_count'
+                    ]
+                )
+                .filter(
+                    pl.col('node_id').is_in(
+                        ranked_candidates_non_targets['node_id']
+                        .to_list()
+                    )
+                )
+                .collect(
+                    engine = 'streaming'
+                ),
+                on = 'node_id',
+                how = 'left'
+            )
+            .select(
+                [
+                    'global_rank',
+                    'node_id',
+                    'account',
+                    forward_score,
+                    'in_degree',
+                    'out_degree',
+                    'account_transaction_event_count'
+                ]
+            )
+        )
