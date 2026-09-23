@@ -937,7 +937,7 @@ class SAMLDRingCaseAnalyzer:
     ) -> pl.DataFrame:
         """ Inspect high-ranked accounts outside the held-out target set """
         # validate whether top_n is an integer instance or non-negative
-        if isinstance(top_n, int) or top_n <= 0:
+        if not isinstance(top_n, int) or top_n <= 0:
             raise ValueError(
                 'top_n must be a positive integer'
             )
