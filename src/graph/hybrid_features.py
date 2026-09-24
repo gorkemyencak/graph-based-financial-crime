@@ -930,9 +930,339 @@ class SAMLDCandidateFeatureBuilder:
         )
 
         # validate all held-out targets present in the candidate feature table
-        if int(target_count) != labeled_table.height:
+        if int(target_count) != target_table.height:
             raise ValueError(
                 'At least one held-out target is absent from the candidate future table'
             )
 
         return labeled_table
+
+    def evaluate_rankings(
+            self,
+            score_columns: Sequence[str],
+            k_values: Sequence[int] = (100, 500, 1_000, 5_000),
+            feature_table: pl.DataFrame | None = None
+    ) -> pl.DataFrame:
+        """ Evaluate label-free scores after ranking all non-seed candidates """
+        # validate the instance type of score columns, and remove duplicates if any present
+        if isinstance(score_columns, str):
+            selected_scores = (score_columns, )
+        else:
+            selected_scores = tuple(
+                dict.fromkeys(score_columns)
+            )
+
+        # validate if score columns is non-empty
+        if not selected_scores:
+            raise ValueError(
+                'At least one score column must be requested'
+            )
+
+        # deduplicate k_values if present
+        selected_k_values = tuple(
+            dict.fromkeys(k_values)
+        )
+
+        # validate if k values is non-empty
+        if not selected_k_values:
+            raise ValueError(
+                'At least one k value must be requested'
+            )
+
+        # validate instance type and non-negativity of k values
+        for k_value in selected_k_values:
+            if not isinstance(k_value, int) or k_value <= 0:
+                raise ValueError(
+                    'Every k value must be a positive integer'
+                )
+
+        # feature table
+        features = (
+            feature_table
+            if feature_table is not None
+            else self.build_feature_table(
+                force_recompute = False
+            )
+        )
+
+        # validate feature table
+        self._validate_feature_table(
+            feature_table = features
+        )
+
+        # unknown score columns
+        unknown_scores = set(selected_scores) - set(features.columns)
+
+        # validate if unknown score columns is empty
+        if unknown_scores:
+            sorted_unknown_scores = ', '.join(
+                sorted(unknown_scores)
+            )
+
+            raise ValueError(
+                f'Unknown score columns: {sorted_unknown_scores}'
+            )
+
+        # targets table
+        targets = (
+            self.targets
+            .select(
+                [
+                    'node_id',
+                    'ring_id'
+                ]
+            )
+            .collect(
+                engine = 'streaming'
+            )
+        )
+
+        # validate if target table is empty
+        if targets.is_empty():
+            raise ValueError(
+                'Ranking evaluation requires at least one held-out target'
+            )
+
+        # candidate count
+        candidate_count = features.height
+
+        # target count
+        target_count = targets.height
+
+        # unique ring count
+        ring_count = (
+            targets
+            .get_column('ring_id')
+            .n_unique()
+        )
+
+        # construct non-seed candidate rankings
+        summary_rows: list[dict[str, str | int | float]] = []
+
+        for score_column in selected_scores:
+
+            # ranked candidates
+            ranked_candidates = (
+                features
+                .select(
+                    [
+                        'node_id',
+                        score_column
+                    ]
+                )
+                .sort(
+                    [
+                        score_column,
+                        'node_id'
+                    ],
+                    descending = [
+                        True,
+                        False
+                    ]
+                )
+                .with_row_index(
+                    name = 'rank',
+                    offset = 1
+                )
+            )
+
+            # target ranks
+            target_ranks = (
+                targets
+                .join(
+                    ranked_candidates,
+                    on = 'node_id',
+                    how = 'left'
+                )
+            )
+
+            # validate if all target scores are present
+            if target_ranks.get_column('rank').null_count() > 0:
+                raise ValueError(
+                    f'A held-out target is absent from the {score_column!r} ranking'
+                )
+
+            # first target rank
+            first_target_rank_value = (
+                target_ranks
+                .get_column('rank')
+                .min()
+            )
+
+            # validate first target rank value is non-empty
+            if first_target_rank_value is None:
+                raise ValueError(
+                    f'No target ranks are available for {score_column!r}'
+                )
+
+            # validate first target rank value instance type
+            if not isinstance(first_target_rank_value, int):
+                raise TypeError(
+                    f'The minimum target rank must be an integer'
+                )
+
+            # ensure type casting for first target rank
+            first_target_rank = int(first_target_rank_value)
+
+            for k_value in selected_k_values:
+                # effective k
+                effective_k = min(
+                    k_value,
+                    candidate_count
+                )
+
+                # hits
+                hits = (
+                    target_ranks
+                    .filter(
+                        pl.col('rank') <= effective_k
+                    )
+                )
+
+                # target hits
+                target_hits = hits.height
+
+                # ring hits
+                ring_hits = (
+                    hits
+                    .get_column('ring_id')
+                    .n_unique()
+                )
+
+                summary_rows.append(
+                    {
+                        'score_name': score_column,
+                        'requested_k': k_value,
+                        'effective_k': effective_k,
+                        'candidate_count': candidate_count,
+                        'target_count': target_count,
+                        'target_hits_at_k': target_hits,
+                        'precision_at_k': (
+                            target_hits / effective_k
+                        ),
+                        'target_recall_at_k': (
+                            target_hits / target_count
+                        ),
+                        'ring_count': ring_count,
+                        'rings_hit_at_k': ring_hits,
+                        'ring_hit_rate_at_k': (
+                            ring_hits / ring_count
+                        ),
+                        'first_target_rank': first_target_rank
+                    }
+                )
+
+        return (
+            pl.DataFrame(summary_rows)
+            .sort(
+                [
+                    'requested_k',
+                    'target_hits_at_k',
+                    'rings_hit_at_k',
+                    'score_name'
+                ],
+                descending = [
+                    False,
+                    True,
+                    True,
+                    False
+                ]
+            )
+        )
+
+    def validate_feature_file(
+            self,
+            output_path: Path | str
+    ) -> None:
+        """ Validate a persisted candidate feature table """
+        # get feature path
+        feature_path = Path(output_path)
+
+        # validate if feature path exists
+        if not feature_path.is_file():
+            raise FileNotFoundError(
+                f'Candidate feature file does not exist: {feature_path}'
+            )
+
+        # validate if feature path is non-empty
+        if feature_path.stat().st_size == 0:
+            raise ValueError(
+                f'Candidate feature file is empty: {feature_path}'
+            )
+
+        # validate persisted feature table
+        persisted_features = pl.read_parquet(
+            source = feature_path
+        )
+
+        self._validate_feature_table(
+            feature_table = persisted_features
+        )
+
+    def write_feature_table(
+            self,
+            output_path: Path | str,
+            overwrite: bool = False
+    ) -> Path:
+        """ Persist the label-free candidate feature table atomically """
+        # validate overwrite instance type
+        if not isinstance(overwrite, bool):
+            raise TypeError(
+                'overwrite must be a boolean instance'
+            )
+
+        # get feature table path
+        feature_path = Path(output_path)
+
+        # return feature table if it exists and overwrite is False
+        if feature_path.exists() and not overwrite:
+            return feature_path
+
+        # create feature path parent directory
+        feature_path.parent.mkdir(
+            parents = True,
+            exist_ok = True
+        )
+
+        # temporary path,
+        temporary_path = feature_path.with_name(
+            name = f".{feature_path.stem}.tmp{feature_path.suffix}"
+        )
+
+        # dump temporary path
+        temporary_path.unlink(
+            missing_ok = True
+        )
+
+        try:
+            # write parquet file to temporary path
+            self.build_feature_table().write_parquet(
+                file = temporary_path,
+                compression = 'zstd',
+                statistics = True
+            )
+
+            # validate temporary file
+            self.validate_feature_file(
+                output_path = temporary_path
+            )
+
+            # replace temporary file with final file
+            temporary_path.replace(
+                target = feature_path
+            )
+
+            # validate the final feature table
+            self.validate_feature_file(
+                output_path = feature_path
+            )
+
+        except Exception:
+            # dump temporary path
+            temporary_path.unlink(
+                missing_ok = True
+            )
+
+            raise
+
+        return feature_path
