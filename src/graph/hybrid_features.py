@@ -147,7 +147,7 @@ class SAMLDCandidateFeatureBuilder:
             )
 
         # validate non-negative rrf_constant
-        if float(rrf_constant) < 0.0:
+        if float(rrf_constant) <= 0.0:
             raise ValueError(
                 'rrf_constant must be strictly positive'
             )
@@ -1216,6 +1216,11 @@ class SAMLDCandidateFeatureBuilder:
 
         # return feature table if it exists and overwrite is False
         if feature_path.exists() and not overwrite:
+            # validate feature file
+            self.validate_feature_file(
+                output_path = feature_path
+            )
+
             return feature_path
 
         # create feature path parent directory
